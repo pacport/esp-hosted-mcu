@@ -177,19 +177,29 @@ static int rpc_event_callback(ctrl_cmd_t * app_event)
 				break;
 			} /* inner switch case */
 
-			/* HyperFi M2.9 fix: slave 2.12.6 emits WIFI_EVENT_STA_START
-			 * multiple times during init. Each post triggers esp_netif_start()
-			 * (via esp_wifi_remote default handler) → lwip netif_add assert
-			 * "netif already added" on the second STA_START.
-			 * Gate STA_START so it reaches host event loop only once. */
+			/* HyperFi M2.9/P4 setup fix: slave 2.12.6 emits START
+			 * events multiple times during init. Each post triggers
+			 * esp_netif_start() via the Wi-Fi default handler, so a duplicate
+			 * START event hits lwIP netif_add assert "netif already added".
+			 * Gate START events so each reaches the host event loop once. */
+			static bool sta_start_posted = false;
+			static bool ap_start_posted = false;
 			if (wifi_event_id == WIFI_EVENT_STA_START) {
-				static bool sta_start_posted = false;
 				if (sta_start_posted) {
 					/* Silent drop. Was HF_DBG_RPCWRAP printf during M2.9
 					 * debug — removed 2026-04-24. */
 					break;
 				}
 				sta_start_posted = true;
+			} else if (wifi_event_id == WIFI_EVENT_STA_STOP) {
+				sta_start_posted = false;
+			} else if (wifi_event_id == WIFI_EVENT_AP_START) {
+				if (ap_start_posted) {
+					break;
+				}
+				ap_start_posted = true;
+			} else if (wifi_event_id == WIFI_EVENT_AP_STOP) {
+				ap_start_posted = false;
 			}
 			g_h.funcs->_h_event_wifi_post(wifi_event_id, 0, 0, HOSTED_BLOCK_MAX);
 
@@ -1099,8 +1109,13 @@ int rpc_wifi_sta_get_ap_info(wifi_ap_record_t *ap_info)
 	resp = rpc_slaveif_wifi_sta_get_ap_info(req);
 
 	if (resp && resp->resp_event_status == SUCCESS) {
-		g_h.funcs->_h_memcpy(ap_info, resp->u.wifi_scan_ap_list.out_list,
-				sizeof(wifi_ap_record_t));
+		if (!resp->u.wifi_scan_ap_list.out_list) {
+			ESP_LOGE(TAG, "WifiStaGetApInfo response missing AP record");
+			resp->resp_event_status = RPC_ERR_PROTOBUF_DECODE;
+		} else {
+			g_h.funcs->_h_memcpy(ap_info, resp->u.wifi_scan_ap_list.out_list,
+					sizeof(wifi_ap_record_t));
+		}
 	}
 	return rpc_rsp_callback(resp);
 }
