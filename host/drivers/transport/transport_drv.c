@@ -212,6 +212,26 @@ static void transport_serial_free_cb(void *buf)
 	mempool_free(chan_arr[ESP_SERIAL_IF]->memp, buf);
 }
 
+static uint32_t sta_tx_alloc_drops;
+static uint32_t ap_tx_alloc_drops;
+
+static esp_err_t transport_tx_no_mem(const char *if_name, uint32_t *drop_count,
+		size_t len)
+{
+	(*drop_count)++;
+	if (*drop_count <= 3 || (*drop_count % 100) == 0) {
+		ESP_LOGW(TAG, "%s TX DMA pool exhausted; dropping frame "
+			"(len=%u drops=%lu)", if_name, (unsigned)len,
+			(unsigned long)*drop_count);
+	}
+	errno = -ENOBUFS;
+#if defined(ESP_ERR_ESP_NETIF_TX_FAILED)
+	return ESP_ERR_ESP_NETIF_TX_FAILED;
+#else
+	return ESP_ERR_ESP_NETIF_NO_MEM;
+#endif
+}
+
 static esp_err_t transport_drv_sta_tx(void *h, void *buffer, size_t len)
 {
 	void * copy_buff = NULL;
@@ -236,7 +256,8 @@ static esp_err_t transport_drv_sta_tx(void *h, void *buffer, size_t len)
 
 	/*  Prepare transport buffer directly consumable */
 	copy_buff = mempool_alloc(((struct mempool*)chan_arr[ESP_STA_IF]->memp), MAX_TRANSPORT_BUFFER_SIZE, true);
-	assert(copy_buff);
+	if (!copy_buff)
+		return transport_tx_no_mem("STA", &sta_tx_alloc_drops, len);
 	g_h.funcs->_h_memcpy(copy_buff+H_ESP_PAYLOAD_HEADER_OFFSET, buffer, len);
 
 	return esp_hosted_tx(ESP_STA_IF, 0, copy_buff, len, H_BUFF_ZEROCOPY, transport_sta_free_cb);
@@ -253,7 +274,8 @@ static esp_err_t transport_drv_ap_tx(void *h, void *buffer, size_t len)
 
 	/*  Prepare transport buffer directly consumable */
 	copy_buff = mempool_alloc(((struct mempool*)chan_arr[ESP_AP_IF]->memp), MAX_TRANSPORT_BUFFER_SIZE, true);
-	assert(copy_buff);
+	if (!copy_buff)
+		return transport_tx_no_mem("AP", &ap_tx_alloc_drops, len);
 	g_h.funcs->_h_memcpy(copy_buff+H_ESP_PAYLOAD_HEADER_OFFSET, buffer, len);
 
 	return esp_hosted_tx(ESP_AP_IF, 0, copy_buff, len, H_BUFF_ZEROCOPY, transport_ap_free_cb);

@@ -8,6 +8,7 @@
 #include "esp_hosted_transport.h"
 #include "esp_hosted_bitmasks.h"
 #include "esp_hosted_config.h"
+#include "esp_hosted_rpc.h"
 
 DEFINE_LOG_TAG(rpc_rsp);
 
@@ -642,5 +643,10 @@ int rpc_parse_rsp(Rpc *rpc_msg, ctrl_cmd_t *app_resp)
 
 	/* 5. Free up buffers in failure cases */
 fail_parse_rpc_msg:
+	/* Keep malformed synchronous responses deliverable so the waiting caller
+	 * is released, but never let a zero-initialized status masquerade as
+	 * SUCCESS with missing payload pointers. */
+	if (app_resp && app_resp->resp_event_status == SUCCESS)
+		app_resp->resp_event_status = RPC_ERR_PROTOBUF_DECODE;
 	return SUCCESS;
 }

@@ -22,6 +22,7 @@
 
 #define MEMPOOL_ALIGNMENT_BYTES          64
 #define MEMPOOL_ALIGNMENT_MASK           (MEMPOOL_ALIGNMENT_BYTES-1)
+#define MEMPOOL_MAX_CACHED_BLOCKS        8
 #define IS_MEMPOOL_ALIGNED(VAL)          (!((VAL)& MEMPOOL_ALIGNMENT_MASK))
 #define MEMPOOL_ALIGNED(VAL)             ((VAL) + MEMPOOL_ALIGNMENT_BYTES - \
                                              ((VAL)& MEMPOOL_ALIGNMENT_MASK))
@@ -41,6 +42,7 @@ struct mempool {
 	mempool_t head;
 	void * spinlock;
 	uint32_t block_size;
+	uint32_t cached_blocks;
 };
 #endif
 

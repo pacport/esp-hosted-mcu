@@ -52,6 +52,7 @@ struct mempool * mempool_create(uint32_t block_size)
 	new->spinlock = g_h.funcs->_h_create_lock_mempool();
 
 	new->block_size = MEMPOOL_ALIGNED(block_size);
+	new->cached_blocks = 0;
 	SLIST_INIT(&(new->head));
 
 
@@ -75,6 +76,7 @@ void mempool_destroy(struct mempool* mp)
 
 	while ((node1 = SLIST_FIRST(&(mp->head))) != NULL) {
 		SLIST_REMOVE_HEAD(&(mp->head), entries);
+		mp->cached_blocks--;
 		g_h.funcs->_h_free(node1);
 	}
 	SLIST_INIT(&(mp->head));
@@ -98,6 +100,7 @@ void * mempool_alloc(struct mempool* mp, int nbytes, int need_memset)
 	if (!SLIST_EMPTY(&(mp->head))) {
 		buf = SLIST_FIRST(&(mp->head));
 		SLIST_REMOVE_HEAD(&(mp->head), entries);
+		mp->cached_blocks--;
 
 
 	g_h.funcs->_h_unlock_mempool(mp->spinlock);
@@ -140,10 +143,19 @@ void mempool_free(struct mempool* mp, void *mem)
 
 	g_h.funcs->_h_lock_mempool(mp->spinlock);
 
-
-	SLIST_INSERT_HEAD(&(mp->head), (struct mempool_entry *)mem, entries);
+	if (mp->cached_blocks < MEMPOOL_MAX_CACHED_BLOCKS) {
+		SLIST_INSERT_HEAD(&(mp->head), (struct mempool_entry *)mem, entries);
+		mp->cached_blocks++;
+		mem = NULL;
+	}
 
 	g_h.funcs->_h_unlock_mempool(mp->spinlock);
+
+	/* A burst may need many in-flight DMA blocks, but retaining the entire
+	 * high-water mark permanently starves other internal-memory users such as
+	 * mbedTLS. Keep a small hot cache and return surplus blocks to the heap. */
+	if (mem)
+		g_h.funcs->_h_free(mem);
 
 #if H_MEM_STATS
 	h_stats_g.mp_stats.num_free++;

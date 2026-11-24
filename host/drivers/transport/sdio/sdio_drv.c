@@ -20,6 +20,7 @@
 #include "serial_drv.h"
 #include "stats.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_hosted_log.h"
 #include "hci_drv.h"
 #include "endian.h"
@@ -41,6 +42,8 @@ static const char TAG[] = "H_SDIO_DRV";
 #define TX_TASK_STACK_SIZE                4096
 #define PROCESS_RX_TASK_STACK_SIZE        4096
 #define RX_TIMEOUT_TICKS                  50
+#define RX_BUFFER_ALLOC_RETRIES           10
+#define RX_BUFFER_ALLOC_RETRY_MS          10
 
 #define BUFFER_AVAILABLE                  1
 #define BUFFER_UNAVAILABLE                0
@@ -105,6 +108,12 @@ static uint32_t sdio_tx_buf_count = 0;
 
 /* Counter to hold the amount of bytes already received from sdio slave */
 static uint32_t sdio_rx_byte_count = 0;
+
+/* Reliability counters for transient packet-mode RX backpressure. */
+static uint32_t sdio_rx_alloc_retries = 0;
+static uint32_t sdio_rx_handover_drops = 0;
+static uint32_t sdio_rx_emergency_drops = 0;
+static uint8_t *sdio_rx_emergency_buf = NULL;
 
 // one-time trigger to start write thread
 static bool sdio_start_write_thread = false;
@@ -808,6 +817,7 @@ static void sdio_read_task(void const* pvParameters)
 	uint32_t len_to_read;
 	uint8_t *pos;
 	uint32_t interrupts;
+	bool drop_after_read;
 
 #if DO_COMBINED_REG_READ
 	uint32_t *intr_index = NULL;
@@ -850,6 +860,7 @@ static void sdio_read_task(void const* pvParameters)
 	sdio_generate_slave_intr(ESP_OPEN_DATA_PATH);
 
 	for (;;) {
+		drop_after_read = false;
 
 		// wait for sdio interrupt from slave
 		// call will block until there is an interrupt, timeout or error
@@ -925,9 +936,57 @@ static void sdio_read_task(void const* pvParameters)
 		}
 #endif
 
-		/* Allocate rx buffer */
-		rxbuff = sdio_rx_get_buffer(len_from_slave);
-		assert(rxbuff);
+		/* Packet-mode buffers live in DMA-capable internal SRAM.  Under a
+		 * short RX consumer stall the pool can be temporarily empty even when
+		 * total (mostly PSRAM) heap is healthy.  Give the consumer a bounded
+		 * chance to return a buffer instead of turning backpressure into a
+		 * fatal assert. */
+		for (uint32_t attempt = 0; attempt <= RX_BUFFER_ALLOC_RETRIES; attempt++) {
+			rxbuff = sdio_rx_get_buffer(len_from_slave);
+			if (rxbuff) {
+				break;
+			}
+			sdio_rx_alloc_retries++;
+			if (attempt < RX_BUFFER_ALLOC_RETRIES) {
+				vTaskDelay(pdMS_TO_TICKS(RX_BUFFER_ALLOC_RETRY_MS));
+			}
+		}
+		if (!rxbuff) {
+			if (sdio_rx_emergency_buf) {
+				rxbuff = sdio_rx_emergency_buf;
+				drop_after_read = true;
+				sdio_rx_emergency_drops++;
+				if (sdio_rx_emergency_drops <= 3 ||
+					(sdio_rx_emergency_drops % 100) == 0) {
+					ESP_LOGW(TAG,
+						"RX DMA pool exhausted after %d ms; draining packet "
+						"with reserved buffer (len=%lu drops=%lu retries=%lu "
+						"internal_free=%u largest_dma=%u)",
+						RX_BUFFER_ALLOC_RETRIES * RX_BUFFER_ALLOC_RETRY_MS,
+						(unsigned long)len_from_slave,
+						(unsigned long)sdio_rx_emergency_drops,
+						(unsigned long)sdio_rx_alloc_retries,
+						(unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL |
+							MALLOC_CAP_8BIT),
+						(unsigned)heap_caps_get_largest_free_block(
+							MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
+				}
+			} else {
+				ESP_LOGE(TAG,
+				"RX DMA buffer unavailable after %d ms (len=%lu retries=%lu "
+				"internal_free=%u largest_dma=%u), and no reserved buffer; "
+				"restarting host",
+				RX_BUFFER_ALLOC_RETRIES * RX_BUFFER_ALLOC_RETRY_MS,
+				(unsigned long)len_from_slave,
+				(unsigned long)sdio_rx_alloc_retries,
+				(unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+				(unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+					MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
+				SDIO_DRV_UNLOCK();
+				g_h.funcs->_h_restart_host();
+				continue;
+			}
+		}
 
 		data_left = len_from_slave;
 		pos = rxbuff;
@@ -969,6 +1028,13 @@ static void sdio_read_task(void const* pvParameters)
 		if (unlikely(ret))
 			continue;
 
+		/* The reserved buffer belongs exclusively to this read task.  It lets
+		 * us consume one packet from the slave when every normal DMA buffer is
+		 * held downstream, breaking sustained-RX backpressure without rebooting
+		 * or handing shared storage to another task. */
+		if (drop_after_read)
+			continue;
+
 		if (double_buf.read_index < 0) {
 			double_buf.read_index = double_buf.write_index;
 			double_buf.read_data_len = len_from_slave;
@@ -976,8 +1042,22 @@ static void sdio_read_task(void const* pvParameters)
 			// trigger task to copy data to queue
 			g_h.funcs->_h_post_semaphore(sem_double_buf_xfer_data);
 		} else {
-			// error: task to copy data to queue still running
-			ESP_LOGE(TAG, "task still writing Rx data to queue!");
+			/* The packet was already drained from the slave and its byte count
+			 * advanced, so it must be dropped.  In packet mode this buffer came
+			 * from the SDIO mempool; failing to return it leaks one 1536-byte DMA
+			 * block per collision until sdio_buffer_alloc() asserts.  Streaming
+			 * mode keeps its persistent double buffer, so sdio_rx_free_buffer()
+			 * intentionally remains a no-op there. */
+			sdio_rx_free_buffer(rxbuff);
+			sdio_rx_handover_drops++;
+			if (sdio_rx_handover_drops <= 3 ||
+				(sdio_rx_handover_drops % 1000) == 0) {
+				ESP_LOGW(TAG,
+					"RX handover busy: dropped packet and returned buffer "
+					"(drops=%lu alloc_retries=%lu)",
+					(unsigned long)sdio_rx_handover_drops,
+					(unsigned long)sdio_rx_alloc_retries);
+			}
 			// don't send data to task, or update write_index
 		}
 	}
@@ -1112,6 +1192,17 @@ void transport_init_internal(void)
 	}
 
 	sdio_mempool_create();
+
+	/* Keep one DMA-capable packet buffer out of the unbounded mempool cache.
+	 * It is used only by sdio_read_task to drain-and-drop while all normal RX
+	 * buffers are in flight. */
+	sdio_rx_emergency_buf = (uint8_t *)MEM_ALLOC(MAX_SDIO_BUFFER_SIZE);
+	if (!sdio_rx_emergency_buf) {
+		ESP_LOGE(TAG, "could not reserve SDIO RX emergency buffer");
+	} else {
+		ESP_LOGI(TAG, "reserved %d-byte SDIO RX emergency buffer @ %p",
+			MAX_SDIO_BUFFER_SIZE, sdio_rx_emergency_buf);
+	}
 
 	/* initialise SDMMC before starting read/write threads
 	 * which depend on SDMMC*/
